@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Extracted build artifacts (large binaries — regenerate with derive_offsets.py)
+libphp.so
+libc.so.6
+*.so
+*.so.*
+
+# Runtime output (produced by bulk.py / scanner.py)
+bulk_scan.csv
+bulk_exploit.csv
+pwn.txt
+*.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

