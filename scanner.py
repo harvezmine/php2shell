@@ -616,56 +616,133 @@ def version_verdict(powered_by: str) -> Optional[str]:
     return "FIXED" if patch >= fixed_patch else "VULNERABLE"
 
 
+def affected_version(powered_by: str) -> Optional[bool]:
+    """True if X-Powered-By advertises an unpatched affected release
+    (8.2-8.5 below its fixed patch), False if it advertises a known PHP
+    release that php2shell does not affect (patched or out of range), and
+    None if no PHP version is advertised."""
+    match = VERSION_PATTERN.search(powered_by)
+    if not match:
+        return None
+    major, minor, patch = (int(value) for value in match.groups())
+    fixed_patch = FIXED_VERSIONS.get((major, minor))
+    if fixed_patch is None:
+        return False
+    return patch < fixed_patch
+
+
 def crash_signal(
     control: HTTPResult, probe: HTTPResult, sapi: str
-) -> Tuple[Optional[str], Optional[str]]:
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Classify a handler crash as ``(sapi_key, label, reason)``.
+
+    ``sapi_key`` is one of ``"fpm"``, ``"mod_php"`` or ``"unknown"``
+    (ambiguous). All three values are ``None`` when no crash is detected.
+    """
+
+    def key_and_label() -> Tuple[str, str]:
+        if sapi == "fpm":
+            return "fpm", "PHP-FPM"
+        if sapi == "mod_php":
+            return "mod_php", "mod_php"
+        return "unknown", "mod_php/PHP-FPM"
+
     if (
         b"Allowed memory size of " in probe.body
         and b" bytes exhausted" in probe.body
         and b"Unknown" in probe.body
     ):
-        mode = (
-            "PHP-FPM"
-            if sapi == "fpm"
-            else "mod_php"
-            if sapi == "mod_php"
-            else "mod_php/PHP-FPM"
-        )
+        key, label = key_and_label()
         return (
-            mode,
+            key,
+            label,
             "in-band PHP fatal error (memory exhausted in Unknown) raised while "
             "parsing the multipart body",
         )
 
     if probe.status_code == 500 and control.body and not probe.body:
-        mode = (
-            "PHP-FPM"
-            if sapi == "fpm"
-            else "mod_php"
-            if sapi == "mod_php"
-            else "mod_php/PHP-FPM"
-        )
+        key, label = key_and_label()
         return (
-            mode,
+            key,
+            label,
             "HTTP 500 with an empty body although the control request produced output",
         )
 
     if sapi == "mod_php":
-        return None, None
+        return None, None, None
 
     if probe.status_code in (502, 503, 504):
         return (
+            "fpm",
             "PHP-FPM",
             f"HTTP {probe.status_code} from the web server fronting PHP-FPM "
             "(worker died mid-request)",
         )
     if probe.status_code == 200 and control.body and not probe.body:
         return (
+            "fpm",
             "PHP-FPM",
             "HTTP 200 with an empty body although the control request produced "
             "output (worker died mid-request)",
         )
-    return None, None
+    return None, None, None
+
+
+def classify_crash(
+    sapi_key: Optional[str], powered_by: str, crash_note: str
+) -> dict:
+    """Map a detected crash to a ``vulnerable``/``verdict``/``reason`` trio.
+
+    Only a mod_php worker crash combined with an unpatched affected release
+    is treated as a confirmed RCE (``VULNERABLE``). PHP-FPM crashes, out-of
+    range versions and ambiguous SAPIs are downgraded so the ``vulnerable``
+    flag stays reserved for the cases that are actually exploitable.
+    """
+    if sapi_key == "mod_php":
+        in_range = affected_version(powered_by)
+        if in_range is True:
+            return {
+                "vulnerable": True,
+                "verdict": "VULNERABLE",
+                "reason": (
+                    f"{crash_note}; mod_php worker crash and an unpatched "
+                    f"affected release ({powered_by}) both confirmed"
+                ),
+            }
+        if in_range is None:
+            return {
+                "verdict": "INCONCLUSIVE",
+                "error": (
+                    "mod_php crash observed but no PHP version advertised, "
+                    "so the affected range cannot be confirmed"
+                ),
+                "reason": f"{crash_note}; PHP version unknown",
+            }
+        return {
+            "vulnerable": False,
+            "verdict": "CRASH",
+            "reason": (
+                f"{crash_note}; mod_php but {powered_by} is outside the "
+                "affected range, so this is a generic crash, not php2shell RCE"
+            ),
+        }
+    if sapi_key == "fpm":
+        return {
+            "vulnerable": False,
+            "verdict": "CRASH",
+            "reason": (
+                f"{crash_note}; PHP-FPM respawns its workers, so this is a "
+                "DoS/robustness signal rather than the mod_php php2shell RCE"
+            ),
+        }
+    return {
+        "verdict": "INCONCLUSIVE",
+        "error": (
+            "crash observed but the SAPI is ambiguous; re-run with "
+            "--sapi mod_php to confirm whether it is exploitable"
+        ),
+        "reason": f"{crash_note}; SAPI ambiguous",
+    }
 
 
 def describe_response(response: HTTPResult) -> str:
@@ -765,6 +842,7 @@ def check_url(
     verify_ssl: bool,
     custom_headers: Dict[str, str],
     sapi: str,
+    passive: bool = False,
 ) -> dict:
     result = base_result(host)
     result["tested_url"] = target_url
@@ -830,6 +908,32 @@ def check_url(
             return result
 
     powered_by = control.powered_by
+
+    if passive:
+        by_version = version_verdict(powered_by)
+        result["powered_by"] = powered_by or None
+        if by_version == "VULNERABLE":
+            result["vulnerable"] = None
+            result["verdict"] = "UNPATCHED"
+            result["reason"] = (
+                "passive check: X-Powered-By reports an unpatched release ("
+                + powered_by
+                + ")"
+            )
+        elif by_version == "FIXED":
+            result["vulnerable"] = False
+            result["verdict"] = "FIXED"
+            result["reason"] = (
+                "passive check: X-Powered-By reports a patched release ("
+                + powered_by
+                + ")"
+            )
+        else:
+            result["vulnerable"] = False
+            result["verdict"] = "NO SIGNAL"
+            result["reason"] = "passive check: no PHP version advertised"
+        return result
+
     rejected = False
     rejected_reason = None
 
@@ -876,15 +980,14 @@ def check_url(
             )
             break
 
-        detected_sapi, signal = crash_signal(control, probe, sapi)
+        sapi_key, sapi_label, signal = crash_signal(control, probe, sapi)
         if signal:
-            result["vulnerable"] = True
-            result["verdict"] = "VULNERABLE"
-            result["sapi"] = detected_sapi
-            result["reason"] = (
+            result["sapi"] = sapi_label
+            crash_note = (
                 f"probe {index} ({size_mib} MiB, {parts} parts) crashed the "
                 f"request handler: {signal}"
             )
+            result.update(classify_crash(sapi_key, powered_by, crash_note))
             return result
 
         if version_verdict(powered_by) == "FIXED":
@@ -899,14 +1002,15 @@ def check_url(
     by_version = version_verdict(powered_by)
     result["powered_by"] = powered_by or None
     if by_version == "VULNERABLE":
-        result["vulnerable"] = True
-        result["verdict"] = "VULNERABLE"
+        result["vulnerable"] = None
+        result["verdict"] = "UNPATCHED"
         result["sapi"] = (
             "unknown" if sapi == "auto" else "PHP-FPM" if sapi == "fpm" else "mod_php"
         )
         result["reason"] = (
-            "no crash observed; X-Powered-By reports an unpatched release: "
+            "no crash observed; X-Powered-By reports an unpatched release ("
             + powered_by
+            + ") but the OOM was not triggered, so RCE is not confirmed"
         )
     elif by_version == "FIXED":
         result["vulnerable"] = False
@@ -933,6 +1037,7 @@ def check_vulnerability(
     custom_headers: Optional[Dict[str, str]] = None,
     sapi: str = "auto",
     paths: Optional[List[str]] = None,
+    passive: bool = False,
 ) -> dict:
     display_host = safe_url_label(host)
     try:
@@ -947,7 +1052,14 @@ def check_vulnerability(
         [replace_path(normalized, path) for path in paths] if paths else [normalized]
     )
     fallback: Optional[dict] = None
-    fallback_priority = {"NO SIGNAL": 0, "FIXED": 1, "INCONCLUSIVE": 2, "ERROR": 2}
+    fallback_priority = {
+        "NO SIGNAL": 0,
+        "FIXED": 1,
+        "CRASH": 2,
+        "INCONCLUSIVE": 3,
+        "UNPATCHED": 4,
+        "ERROR": 3,
+    }
     for target_url in targets:
         result = check_url(
             normalized,
@@ -956,6 +1068,7 @@ def check_vulnerability(
             verify_ssl,
             custom_headers or {},
             sapi,
+            passive,
         )
         if result["vulnerable"] is True:
             return result
@@ -1094,6 +1207,10 @@ def print_result(result: dict, verbose: bool = False) -> None:
     verdict = result["verdict"]
     if result["vulnerable"] is True:
         status = colorize("[VULNERABLE]", Colors.RED + Colors.BOLD)
+    elif verdict == "CRASH":
+        status = colorize("[CRASH]", Colors.YELLOW + Colors.BOLD)
+    elif verdict == "UNPATCHED":
+        status = colorize("[UNPATCHED]", Colors.YELLOW)
     elif result["vulnerable"] is False:
         status = colorize("[NOT VULNERABLE]", Colors.GREEN)
     elif verdict == "INCONCLUSIVE":
@@ -1186,7 +1303,14 @@ Examples:
         "--sapi",
         choices=("auto", "mod_php", "fpm"),
         default="auto",
-        help="Verdict rules to use (default: auto)",
+        help="Server API to assume (default: auto). A confirmed RCE verdict "
+        "requires --sapi mod_php; PHP-FPM crashes are reported as CRASH, "
+        "not VULNERABLE",
+    )
+    parser.add_argument(
+        "--passive",
+        action="store_true",
+        help="Passive scan: read X-Powered-By only, no crash-triggering probes",
     )
     parser.add_argument(
         "--path", action="append", dest="paths", help="Custom path to test; repeatable"
@@ -1243,6 +1367,13 @@ def main() -> None:
         print(colorize(f"[*] Using {args.threads} thread(s)", Colors.CYAN))
         print(colorize(f"[*] Timeout: {args.timeout}s", Colors.CYAN))
         print(colorize(f"[*] SAPI rules: {args.sapi}", Colors.CYAN))
+        if args.passive:
+            print(
+                colorize(
+                    "[*] Passive mode: header check only (no crash probes)",
+                    Colors.CYAN,
+                )
+            )
         if args.insecure:
             print(colorize("[!] TLS verification disabled", Colors.YELLOW))
         print()
@@ -1261,6 +1392,7 @@ def main() -> None:
                 custom_headers=custom_headers,
                 sapi=args.sapi,
                 paths=paths,
+                passive=args.passive,
             )
         except Exception as exc:  # Keep one bad target from aborting a scan.
             result = base_result(safe_url_label(host))
@@ -1268,7 +1400,7 @@ def main() -> None:
             result["reason"] = result["error"]
             return result
 
-    if len(hosts) > 1:
+    if len(hosts) > 1 and not args.passive:
         for probe in PROBES:
             build_probe_body(*probe)
 
@@ -1303,19 +1435,29 @@ def main() -> None:
                     progress.update(1)
 
     vulnerable_count = sum(result["vulnerable"] is True for result in results)
-    error_count = sum(result["vulnerable"] is None for result in results)
+    crash_count = sum(result["verdict"] == "CRASH" for result in results)
+    unpatched_count = sum(result["verdict"] == "UNPATCHED" for result in results)
+    inconclusive_count = sum(
+        result["vulnerable"] is None and result["verdict"] != "UNPATCHED"
+        for result in results
+    )
+    clean_count = sum(
+        result["verdict"] in ("FIXED", "NO SIGNAL") for result in results
+    )
     if not args.quiet:
         print()
         print(colorize("=" * 60, Colors.CYAN))
         print(colorize("SCAN SUMMARY", Colors.BOLD))
         print(colorize("=" * 60, Colors.CYAN))
         print(f"  Total hosts scanned: {len(hosts)}")
-        vulnerable_label = f"Vulnerable: {vulnerable_count}"
+        vulnerable_label = f"Confirmed vulnerable (RCE): {vulnerable_count}"
         if vulnerable_count:
             vulnerable_label = colorize(vulnerable_label, Colors.RED + Colors.BOLD)
         print(f"  {vulnerable_label}")
-        print(f"  Not vulnerable: {len(results) - vulnerable_count - error_count}")
-        print(f"  Inconclusive/errors: {error_count}")
+        print(f"  Unpatched, not confirmed (no crash): {unpatched_count}")
+        print(f"  Handler crash (DoS, not RCE): {crash_count}")
+        print(f"  Clean (FIXED / no signal): {clean_count}")
+        print(f"  Inconclusive/errors: {inconclusive_count}")
         print(colorize("=" * 60, Colors.CYAN))
 
     output_saved = True

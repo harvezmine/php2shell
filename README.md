@@ -34,32 +34,59 @@ Butuh Python 3.9+.
 
 ---
 
-## 3. Use case — SCAN (deteksi, tidak exploit)
-
-### Satu URL
-
-```bash
-python3 scanner.py -u https://target.com/index.php -v
-```
-
-### Banyak target (file list / CSV / JSON)
-
-```bash
-python3 scanner.py -l targets.txt -t 20 -o hasil.json
-python3 scanner.py -l targets.example.csv -t 20 -o hasil.json --all-results
-```
+## 3. Use case — SCAN (deteksi)
 
 `-l` menerima 3 format otomatis:
 - **list biasa** — satu URL per baris.
-- **CSV** — baris header dengan kolom `url` (kolom lain diabaikan).
+- **CSV** — baris header dengan kolom `url`.
 - **JSON array** — `["https://a.com", "https://b.com"]`.
 
-Flag penting scanner:
+### A. Passive scan (aman — cuma baca header)
+
+Tidak kirim probe crash. Cuma baca versi PHP dari `X-Powered-By`. Aman untuk
+target yang tidak boleh diganggu.
 
 ```bash
--k                 # matikan verifikasi TLS (sering perlu, lihat §7)
---sapi mod_php     # cari target yang benar-benar bisa di-exploit (mod_php)
---sapi fpm         # deteksi crash di PHP-FPM
+# 1 target
+python3 scanner.py -u https://target.com/index.php --passive
+
+# banyak target
+python3 scanner.py -l targets.txt --passive -t 20 -o hasil.json --all-results
+```
+
+Hasil: `UNPATCHED` (belum patch) / `FIXED` (sudah patch) / `NO SIGNAL`.
+
+### B. Active scan (kirim probe — deteksi crash)
+
+Kirim multipart (1/8/20 MiB) untuk memicu OOM. Inilah yang memastikan target
+benar-benar crash. Pakai `--sapi mod_php` supaya yang ditandai **VULNERABLE**
+benar-benar bisa di-exploit (RCE).
+
+```bash
+# 1 target — pastikan mod_php
+python3 scanner.py -u https://target.com/index.php --sapi mod_php -v
+
+# banyak target
+python3 scanner.py -l targets.txt --sapi mod_php -t 20 -o hasil.json
+```
+
+Verdict (yang penting):
+
+| Verdict | Arti |
+|---|---|
+| `VULNERABLE` | Crash + mod_php + versi affected → **pasti RCE**. |
+| `CRASH` | Handler crash, tapi BUKAN RCE (PHP-FPM / versi di luar range). |
+| `UNPATCHED` | Versi belum patch tapi tidak crash (belum tentu bisa). |
+| `INCONCLUSIVE` | SAPI/versi tidak jelas — ulangi dengan `--sapi mod_php`. |
+| `FIXED` / `NO SIGNAL` | Aman / tidak ada sinyal. |
+
+Flag penting:
+
+```bash
+--passive          # mode pasif (aman, tanpa probe crash)
+-k                 # matikan verifikasi TLS
+--sapi mod_php     # untuk konfirmasi RCE (VULNERABLE)
+--sapi fpm         # deteksi crash PHP-FPM (keluar sebagai CRASH)
 --all-results      # simpan semua hasil, bukan cuma yang vuln
 ```
 
@@ -139,9 +166,9 @@ Flag `bulk.py`:
 
 Output: `bulk_scan.csv` (hasil deteksi) dan `bulk_exploit.csv` (hasil RCE).
 
-> ⚠️ Scanner bisa menandai host PHP-FPM sebagai VULNERABLE (worker-nya crash),
-> tapi `exploit.py` **hanya bisa** di mod_php/lsphp. Pakai `--sapi mod_php` untuk
-> menemukan target yang benar-benar bisa di-exploit.
+> ⚠️ `exploit.py` **hanya bisa** di mod_php/lsphp. Di PHP-FPM worker di-respawn,
+> jadi crash-nya bukan RCE. Scanner sudah membedakan: pakai `--sapi mod_php`
+> untuk menemukan target yang benar-benar `VULNERABLE`.
 
 ---
 
@@ -203,8 +230,8 @@ memberi hint yang tepat.
 ## 8. Kapan exploit TIDAK jalan (penting)
 
 - **PHP-FPM / nginx** — worker di-respawn setelah OOM, jadi chain ini tidak
-  mendarat. Scanner tetap bisa menandainya vuln (crash), tapi `exploit.py` tidak
-  bisa. Ini yang membedakan "vulnerable" vs "exploitable".
+  mendarat. Scanner menandainya `CRASH` (bukan `VULNERABLE`), dan `exploit.py`
+  tidak bisa. Ini yang membedakan "crash" vs "RCE".
 - **`session.upload_progress.enabled = Off`** — fitur pemicunya mati.
 - **Banyak prefork worker** — heap grooming tidak stabil.
 - **Offset build belum ada** di `offsets.json` — tambahkan dulu (§6).
