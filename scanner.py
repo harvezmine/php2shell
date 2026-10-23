@@ -631,19 +631,44 @@ def affected_version(powered_by: str) -> Optional[bool]:
     return patch < fixed_patch
 
 
+def detect_server_sapi(headers: Dict[str, str]) -> str:
+    """Infer the web SAPI from the ``Server`` header (mirrors exploit.py's
+    fingerprint). Returns ``"fpm"``, ``"apache"``, ``"lsphp"`` or ``""``
+    (unknown)."""
+    server = header_value(headers, "Server").lower()
+    if "apache" in server:
+        return "apache"
+    if "litespeed" in server:
+        return "lsphp"
+    if "fpm" in server or "nginx" in server or "openresty" in server:
+        return "fpm"
+    return ""
+
+
 def crash_signal(
-    control: HTTPResult, probe: HTTPResult, sapi: str
+    control: HTTPResult, probe: HTTPResult, sapi: str, server_sapi: str = ""
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """Classify a handler crash as ``(sapi_key, label, reason)``.
 
     ``sapi_key`` is one of ``"fpm"``, ``"mod_php"`` or ``"unknown"``
     (ambiguous). All three values are ``None`` when no crash is detected.
+
+    ``server_sapi`` comes from the response ``Server`` header and overrides an
+    explicit ``--sapi mod_php`` when it proves the front-end cannot be mod_php
+    (nginx/openresty/FPM). This keeps a nginx+PHP-FPM target from being falsely
+    marked ``VULNERABLE`` just because the user asserted mod_php.
     """
 
     def key_and_label() -> Tuple[str, str]:
+        if server_sapi == "fpm":
+            return "fpm", "PHP-FPM"
+        if server_sapi == "lsphp":
+            return "mod_php", "lsphp"
         if sapi == "fpm":
             return "fpm", "PHP-FPM"
         if sapi == "mod_php":
+            return "mod_php", "mod_php"
+        if server_sapi == "apache":
             return "mod_php", "mod_php"
         return "unknown", "mod_php/PHP-FPM"
 
@@ -668,7 +693,10 @@ def crash_signal(
             "HTTP 500 with an empty body although the control request produced output",
         )
 
-    if sapi == "mod_php":
+    # mod_php runs in-process with Apache, so it never emits proxy errors
+    # (502/503/504) or a respawned 200-with-empty-body. Suppress those FPM-only
+    # signals unless the Server header already proves a FPM front-end.
+    if server_sapi != "fpm" and sapi == "mod_php":
         return None, None, None
 
     if probe.status_code in (502, 503, 504):
@@ -908,6 +936,10 @@ def check_url(
             return result
 
     powered_by = control.powered_by
+    server_header = header_value(control.headers, "Server")
+    if server_header:
+        result["server"] = server_header
+    server_sapi = detect_server_sapi(control.headers)
 
     if passive:
         by_version = version_verdict(powered_by)
@@ -980,7 +1012,7 @@ def check_url(
             )
             break
 
-        sapi_key, sapi_label, signal = crash_signal(control, probe, sapi)
+        sapi_key, sapi_label, signal = crash_signal(control, probe, sapi, server_sapi)
         if signal:
             result["sapi"] = sapi_label
             crash_note = (
@@ -1304,8 +1336,9 @@ Examples:
         choices=("auto", "mod_php", "fpm"),
         default="auto",
         help="Server API to assume (default: auto). A confirmed RCE verdict "
-        "requires --sapi mod_php; PHP-FPM crashes are reported as CRASH, "
-        "not VULNERABLE",
+        "requires mod_php; PHP-FPM crashes are reported as CRASH, not "
+        "VULNERABLE. A nginx/openresty/FPM Server header always overrides "
+        "--sapi mod_php, since that front-end cannot run mod_php",
     )
     parser.add_argument(
         "--passive",
