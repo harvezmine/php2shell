@@ -74,8 +74,8 @@ Verdict (yang penting):
 
 | Verdict | Arti |
 |---|---|
-| `VULNERABLE` | Crash + mod_php + versi affected → **pasti RCE**. |
-| `CRASH` | Handler crash, tapi BUKAN RCE (PHP-FPM / versi di luar range). |
+| `VULNERABLE` | **Vuln RCE** — crash + mod_php + versi affected → bisa di-exploit penuh. |
+| `CRASH` | **Vuln DoS** — handler crash, tapi bukan RCE (PHP-FPM / versi di luar range). Tetap vuln (DoS), bukan aman. |
 | `UNPATCHED` | Versi belum patch tapi tidak crash (belum tentu bisa). |
 | `INCONCLUSIVE` | SAPI/versi tidak jelas — ulangi dengan `--sapi mod_php`. |
 | `FIXED` / `NO SIGNAL` | Aman / tidak ada sinyal. |

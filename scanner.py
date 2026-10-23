@@ -1238,9 +1238,9 @@ def print_result(result: dict, verbose: bool = False) -> None:
     host = result["host"]
     verdict = result["verdict"]
     if result["vulnerable"] is True:
-        status = colorize("[VULNERABLE]", Colors.RED + Colors.BOLD)
+        status = colorize("[VULNERABLE: RCE]", Colors.RED + Colors.BOLD)
     elif verdict == "CRASH":
-        status = colorize("[CRASH]", Colors.YELLOW + Colors.BOLD)
+        status = colorize("[DoS VULN]", Colors.YELLOW + Colors.BOLD)
     elif verdict == "UNPATCHED":
         status = colorize("[UNPATCHED]", Colors.YELLOW)
     elif result["vulnerable"] is False:
@@ -1483,12 +1483,12 @@ def main() -> None:
         print(colorize("SCAN SUMMARY", Colors.BOLD))
         print(colorize("=" * 60, Colors.CYAN))
         print(f"  Total hosts scanned: {len(hosts)}")
-        vulnerable_label = f"Confirmed vulnerable (RCE): {vulnerable_count}"
+        vulnerable_label = f"Confirmed RCE vulnerability: {vulnerable_count}"
         if vulnerable_count:
             vulnerable_label = colorize(vulnerable_label, Colors.RED + Colors.BOLD)
         print(f"  {vulnerable_label}")
         print(f"  Unpatched, not confirmed (no crash): {unpatched_count}")
-        print(f"  Handler crash (DoS, not RCE): {crash_count}")
+        print(f"  Confirmed DoS vulnerability (handler crash): {crash_count}")
         print(f"  Clean (FIXED / no signal): {clean_count}")
         print(f"  Inconclusive/errors: {inconclusive_count}")
         print(colorize("=" * 60, Colors.CYAN))
